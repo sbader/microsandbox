@@ -1423,6 +1423,14 @@ func call(ctx context.Context, fn func(cancelID C.uint64_t, buf *C.uint8_t, bufL
 	return callBuf(ctx, defaultBufSize, fn)
 }
 
+// defaultBufs reuses call buffers: exec Recv and stdin writes call once per
+// few KiB of terminal I/O, and a fresh 1 MiB buffer each time dominates CPU.
+// Buffers return to the pool only after Rust has finished writing.
+var defaultBufs = sync.Pool{New: func() any {
+	buf := make([]byte, defaultBufSize)
+	return &buf
+}}
+
 // callBuf is call() with a configurable output buffer. Use for FFI calls
 // whose response can exceed defaultBufSize — chiefly streaming Recv paths
 // that relay protocol chunks larger than 1 MiB.
@@ -1432,7 +1440,16 @@ func callBuf(ctx context.Context, bufSize int, fn func(cancelID C.uint64_t, buf 
 		err error
 	}
 	done := make(chan res, 1)
-	buf := make([]byte, bufSize)
+	var buf []byte
+	if bufSize == defaultBufSize {
+		pooled := defaultBufs.Get().(*[]byte)
+		defer defaultBufs.Put(pooled)
+		buf = *pooled
+		// Calls with no output leave the buffer untouched.
+		buf[0] = 0
+	} else {
+		buf = make([]byte, bufSize)
+	}
 	cancelID := C.call_msb_cancel_alloc()
 
 	go func() {
