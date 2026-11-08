@@ -1054,7 +1054,9 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
+      # Forks publish no crates and patch msb_krun from git.
       - name: Validate crates.io publication graph and package manifests
+        if: github.repository == 'superradcompany/microsandbox'
         run: |
           python3 -m unittest scripts.ci.test_publish_crates
           python3 scripts/ci/publish-crates.py --validate-only
@@ -1078,8 +1080,9 @@ jobs:
       - name: Install candidate SDK for production smoke test
         id: smoke-install
         if: >-
+          github.repository == 'superradcompany/microsandbox' && (
           (needs.release-context.outputs.publish == 'true') ||
-          (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
+          (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
         run: |
           platform=sdk/node-ts/npm/linux-x64-gnu
           artifact=node-artifacts/node-sdk-linux-x64-gnu
@@ -1174,10 +1177,11 @@ jobs:
         with:
           script: |
             const { prepareReleaseNotes } = require('./scripts/ci/release-notes.cjs');
-            const body = await prepareReleaseNotes({
-              github, repo: context.repo, tag: process.env.MSB_RELEASE_TAG,
-              serverUrl: context.serverUrl,
-            });
+            const tag = process.env.MSB_RELEASE_TAG;
+            // Forks have no PRs of their own to label.
+            const body = context.repo.owner === 'superradcompany'
+              ? await prepareReleaseNotes({ github, repo: context.repo, tag, serverUrl: context.serverUrl })
+              : (await github.rest.repos.generateReleaseNotes({ ...context.repo, tag_name: tag })).data.body;
             require('node:fs').writeFileSync(`${process.env.RUNNER_TEMP}/release-notes.md`, body);
 
       - name: Create GitHub Release
@@ -1215,7 +1219,7 @@ jobs:
   sync-mintlify:
     name: Sync mintlify branch
     needs: [release-context, assemble]
-    if: needs.release-context.outputs.publish == 'true'
+    if: needs.release-context.outputs.publish == 'true' && github.repository == 'superradcompany/microsandbox'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -1276,7 +1280,7 @@ jobs:
   update-homebrew:
     name: Update Homebrew Formula
     needs: [release-context, assemble]
-    if: needs.release-context.outputs.publish == 'true'
+    if: needs.release-context.outputs.publish == 'true' && github.repository == 'superradcompany/microsandbox'
     runs-on: ubuntu-latest
     steps:
       - name: Dispatch to homebrew tap
@@ -1345,7 +1349,7 @@ jobs:
   npm-publish:
     name: Publish npm packages
     needs: [release-context, release-ready]
-    if: needs.release-context.outputs.publish == 'true'
+    if: needs.release-context.outputs.publish == 'true' && github.repository == 'superradcompany/microsandbox'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -1597,7 +1601,7 @@ jobs:
   crates-publish:
     name: Publish crates
     needs: [release-context, release-ready]
-    if: needs.release-context.outputs.publish == 'true'
+    if: needs.release-context.outputs.publish == 'true' && github.repository == 'superradcompany/microsandbox'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1617,7 +1621,7 @@ jobs:
   pypi-publish:
     name: Publish Python SDK
     needs: [release-context, release-ready]
-    if: needs.release-context.outputs.publish == 'true'
+    if: needs.release-context.outputs.publish == 'true' && github.repository == 'superradcompany/microsandbox'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -1716,7 +1720,7 @@ jobs:
         # returning 404 for users on default GOPROXY in the meantime.
         run: |
           ROOT_TAG="${MSB_RELEASE_TAG}"
-          MODULE="github.com/superradcompany/microsandbox/sdk/go"
+          MODULE="github.com/${{ github.repository }}/sdk/go"
           curl -sSf "https://proxy.golang.org/${MODULE}/@v/${ROOT_TAG}.info" >/dev/null || true
           curl -sSf "https://proxy.golang.org/${MODULE}/@v/${ROOT_TAG}.mod"  >/dev/null || true
           curl -sSf "https://sum.golang.org/lookup/${MODULE}@${ROOT_TAG}"    >/dev/null || true
@@ -1729,7 +1733,7 @@ jobs:
   docker-build:
     name: Docker (${{ matrix.arch }})
     needs: [release-context, release-ready]
-    if: needs.release-context.outputs.publish == 'true'
+    if: needs.release-context.outputs.publish == 'true' && github.repository == 'superradcompany/microsandbox'
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
