@@ -222,3 +222,17 @@ parking_lot = "0.13"
 rpassword = "7"
 russh = "0.65.0"
 russh-sftp = "2.3.0"
+
+# Fork with the macOS balloon page replacement; all msb_krun crates come from it so none are duplicated.
+[patch.crates-io]
+msb_krun = { git = "https://github.com/sbader/libkrun", branch = "sx/v0.1.45" }
+msb_krun_arch = { git = "https://github.com/sbader/libkrun", branch = "sx/v0.1.45" }
+msb_krun_arch_gen = { git = "https://github.com/sbader/libkrun", branch = "sx/v0.1.45" }
+msb_krun_cpuid = { git = "https://github.com/sbader/libkrun", branch = "sx/v0.1.45" }
+msb_krun_devices = { git = "https://github.com/sbader/libkrun", branch = "sx/v0.1.45" }
+msb_krun_hvf = { git = "https://github.com/sbader/libkrun", branch = "sx/v0.1.45" }
+msb_krun_kernel = { git = "https://github.com/sbader/libkrun", branch = "sx/v0.1.45" }
+msb_krun_polly = { git = "https://github.com/sbader/libkrun", branch = "sx/v0.1.45" }
+msb_krun_smbios = { git = "https://github.com/sbader/libkrun", branch = "sx/v0.1.45" }
+msb_krun_utils = { git = "https://github.com/sbader/libkrun", branch = "sx/v0.1.45" }
+msb_krun_vmm = { git = "https://github.com/sbader/libkrun", branch = "sx/v0.1.45" }

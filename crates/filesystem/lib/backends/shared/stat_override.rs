@@ -21,7 +21,7 @@ use std::{
     ffi::CStr,
     io,
     os::fd::RawFd,
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use crate::stat64;
@@ -91,9 +91,85 @@ pub struct BindIdentityMap {
 /// Shared bind identity map that can be installed after guest user resolution.
 pub type BindIdentityMapHandle = Arc<OnceLock<BindIdentityMap>>;
 
+/// An inode's patched owner and mode, reused while the host stat they were patched from keeps
+/// its ctime, which saves reading the override xattr on every lookup. Writing an xattr changes
+/// the host ctime (checked on APFS), so an unchanged ctime means an unchanged override.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[derive(Default)]
+pub(crate) struct PatchedStatCache(Mutex<Option<CachedPatch>>);
+
+#[derive(Clone, Copy, PartialEq)]
+struct PatchFields {
+    uid: u32,
+    gid: u32,
+    mode: u32,
+    rdev: i64,
+}
+
+#[derive(Clone, Copy)]
+struct CachedPatch {
+    ctime: (i64, i64),
+    host: PatchFields,
+    patched: PatchFields,
+    /// The identity map is installed once, possibly after boot, and changes the patched owner.
+    mapped: bool,
+}
+
 //--------------------------------------------------------------------------------------------------
 // Methods
 //--------------------------------------------------------------------------------------------------
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+impl PatchedStatCache {
+    /// `host` patched as stored, if it was stored from a host stat with the same ctime and the
+    /// fields the override replaces.
+    pub(crate) fn get(
+        &self,
+        host: &stat64,
+        bind_identity_map: Option<&BindIdentityMapHandle>,
+    ) -> Option<stat64> {
+        let cached = (*self.0.lock().unwrap())?;
+        if cached.mapped != is_mapped(bind_identity_map)
+            || cached.ctime != ctime(host)
+            || cached.host != PatchFields::of(host)
+        {
+            return None;
+        }
+        let mut st = *host;
+        st.st_uid = cached.patched.uid;
+        st.st_gid = cached.patched.gid;
+        st.st_mode = cached.patched.mode as _;
+        st.st_rdev = cached.patched.rdev as _;
+        Some(st)
+    }
+
+    pub(crate) fn store(
+        &self,
+        host: &stat64,
+        patched: &stat64,
+        bind_identity_map: Option<&BindIdentityMapHandle>,
+    ) {
+        *self.0.lock().unwrap() = Some(CachedPatch {
+            ctime: ctime(host),
+            host: PatchFields::of(host),
+            patched: PatchFields::of(patched),
+            mapped: is_mapped(bind_identity_map),
+        });
+    }
+}
+
+impl PatchFields {
+    // st_mode is u16 and st_rdev i32 on macOS.
+    #[allow(clippy::unnecessary_cast)]
+    fn of(st: &stat64) -> Self {
+        Self {
+            uid: st.st_uid,
+            gid: st.st_gid,
+            mode: st.st_mode as u32,
+            rdev: st.st_rdev as i64,
+        }
+    }
+}
 
 impl BindIdentityMap {
     /// Create a map from one host owner uid to one guest uid/gid pair.
@@ -145,7 +221,7 @@ impl BindIdentityMap {
 /// Returns `EIO` if the xattr is corrupt (wrong version, short read).
 pub(crate) fn patched_stat(
     fd: RawFd,
-    mut st: stat64,
+    st: stat64,
     xattr_enabled: bool,
     strict: bool,
     bind_identity_map: Option<&BindIdentityMapHandle>,
@@ -157,11 +233,45 @@ pub(crate) fn patched_stat(
     // Real symlinks on host cannot have user xattrs on Linux.
     #[cfg(target_os = "linux")]
     if st.st_mode & libc::S_IFMT == libc::S_IFLNK {
+        let mut st = st;
         apply_bind_identity_map(&mut st, bind_identity_map);
         return Ok(st);
     }
 
-    match read_override(fd, strict) {
+    apply_override(st, read_override(fd, strict), bind_identity_map)
+}
+
+/// Like [`patched_stat`], reading the override from `path` without following a final symlink
+/// and without opening the file. On macOS a lookup names the inode by `/.vol/<dev>/<ino>`, so
+/// this saves the open and close that `patched_stat` needs a descriptor for.
+#[cfg(target_os = "macos")]
+pub(crate) fn patched_stat_at_path(
+    path: &CStr,
+    mut st: stat64,
+    xattr_enabled: bool,
+    strict: bool,
+    bind_identity_map: Option<&BindIdentityMapHandle>,
+) -> io::Result<stat64> {
+    if !xattr_enabled {
+        return Ok(st);
+    }
+    match read_override_at_path(path, strict) {
+        // The inode can't be read through its path; patched_stat's callers fall back the same
+        // way when they can't open it.
+        Err(e) if matches!(e.raw_os_error(), Some(libc::EACCES) | Some(libc::EPERM)) => {
+            apply_bind_identity_map(&mut st, bind_identity_map);
+            Ok(st)
+        }
+        result => apply_override(st, result, bind_identity_map),
+    }
+}
+
+fn apply_override(
+    mut st: stat64,
+    result: io::Result<Option<OverrideStat>>,
+    bind_identity_map: Option<&BindIdentityMapHandle>,
+) -> io::Result<stat64> {
+    match result {
         Ok(Some(ovr)) => {
             st.st_uid = ovr.uid;
             st.st_gid = ovr.gid;
@@ -232,6 +342,31 @@ fn read_override(fd: RawFd, strict: bool) -> io::Result<Option<OverrideStat>> {
         )
     };
 
+    parse_override(ret, &buf, strict)
+}
+
+/// Read the override xattr from `path` itself, not from what a final symlink points to.
+#[cfg(target_os = "macos")]
+fn read_override_at_path(path: &CStr, strict: bool) -> io::Result<Option<OverrideStat>> {
+    let mut buf = [0u8; OVERRIDE_SIZE];
+    let ret = unsafe {
+        libc::getxattr(
+            path.as_ptr(),
+            OVERRIDE_XATTR_KEY.as_ptr(),
+            buf.as_mut_ptr() as *mut libc::c_void,
+            OVERRIDE_SIZE,
+            0,
+            libc::XATTR_NOFOLLOW,
+        )
+    };
+    parse_override(ret, &buf, strict)
+}
+
+fn parse_override(
+    ret: isize,
+    buf: &[u8; OVERRIDE_SIZE],
+    strict: bool,
+) -> io::Result<Option<OverrideStat>> {
     if ret < 0 {
         let err = io::Error::last_os_error();
         let errno = err.raw_os_error().unwrap_or(0);
@@ -320,6 +455,14 @@ pub(crate) fn apply_bind_identity_map(
     if let Some(map) = bind_identity_map.and_then(|handle| handle.get().copied()) {
         map.apply(st);
     }
+}
+
+fn is_mapped(bind_identity_map: Option<&BindIdentityMapHandle>) -> bool {
+    bind_identity_map.is_some_and(|handle| handle.get().is_some())
+}
+
+fn ctime(st: &stat64) -> (i64, i64) {
+    (st.st_ctime, st.st_ctime_nsec)
 }
 
 /// Set the override xattr on a file descriptor.
@@ -547,6 +690,77 @@ pub(crate) fn probe_xattr_write_support(dirfd: RawFd) -> io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::{OVERRIDE_XATTR_KEY, PROBE_XATTR_KEY, handle_unsupported_xattr};
+
+    fn host_stat(ctime: i64) -> crate::stat64 {
+        let mut st: crate::stat64 = unsafe { std::mem::zeroed() };
+        st.st_ctime = ctime as _;
+        st.st_uid = 501;
+        st.st_gid = 20;
+        st.st_mode = (libc::S_IFREG | 0o644) as _;
+        st.st_size = 10;
+        st
+    }
+
+    fn patch(host: &crate::stat64) -> crate::stat64 {
+        let mut st = *host;
+        st.st_uid = 0;
+        st.st_gid = 0;
+        st.st_mode = (libc::S_IFREG | 0o600) as _;
+        st
+    }
+
+    #[test]
+    #[allow(clippy::unnecessary_cast)]
+    fn test_patched_stat_cache_reuses_patch_for_same_ctime() {
+        let cache = super::PatchedStatCache::default();
+        let host = host_stat(100);
+        cache.store(&host, &patch(&host), None);
+
+        let mut later = host;
+        later.st_size = 20;
+        later.st_mtime = 5;
+        let st = cache
+            .get(&later, None)
+            .expect("same ctime reuses the patch");
+        assert_eq!(
+            (st.st_uid, st.st_gid, st.st_mode as u32),
+            (0, 0, libc::S_IFREG as u32 | 0o600)
+        );
+        assert_eq!(
+            st.st_size, 20,
+            "fields the override doesn't replace come from the new stat"
+        );
+    }
+
+    #[test]
+    fn test_patched_stat_cache_misses_on_changed_source() {
+        let cache = super::PatchedStatCache::default();
+        assert!(cache.get(&host_stat(100), None).is_none());
+
+        let host = host_stat(100);
+        cache.store(&host, &patch(&host), None);
+        assert!(cache.get(&host_stat(101), None).is_none());
+        let mut nsec = host;
+        nsec.st_ctime_nsec = 1;
+        assert!(cache.get(&nsec, None).is_none());
+        let mut owner = host;
+        owner.st_uid = 502;
+        assert!(cache.get(&owner, None).is_none());
+    }
+
+    #[test]
+    fn test_patched_stat_cache_misses_after_identity_map_installed() {
+        let handle: super::BindIdentityMapHandle = Default::default();
+        let cache = super::PatchedStatCache::default();
+        let host = host_stat(100);
+        cache.store(&host, &host, Some(&handle));
+        assert!(cache.get(&host, Some(&handle)).is_some());
+
+        handle
+            .set(super::BindIdentityMap::new(501, 1000, 1000))
+            .unwrap();
+        assert!(cache.get(&host, Some(&handle)).is_none());
+    }
 
     #[test]
     fn test_xattr_keys_use_msb_namespace() {

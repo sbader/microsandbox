@@ -389,6 +389,7 @@ pub(crate) fn enotempty() -> io::Error {
 }
 
 /// Create an `io::Error` with Linux `ELOOP`.
+#[cfg(target_os = "linux")]
 pub(crate) fn eloop() -> io::Error {
     io::Error::from_raw_os_error(LINUX_ELOOP)
 }

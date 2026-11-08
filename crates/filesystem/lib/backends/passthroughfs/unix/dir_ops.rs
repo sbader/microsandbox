@@ -110,6 +110,9 @@ pub(crate) fn do_readdirplus(
 ) -> io::Result<Vec<(DirEntry<'static>, Entry)>> {
     let dir_entries = do_readdir(fs, ctx, inode, handle, size, offset)?;
     let mut result = Vec::with_capacity(dir_entries.len());
+    let handles = fs.dir_handles.read().unwrap();
+    let data = handles.get(&handle).ok_or_else(platform::ebadf)?;
+    let dir_fd = data.file.read().unwrap().as_raw_fd();
 
     for de in dir_entries {
         let name_bytes = de.name;
@@ -127,7 +130,7 @@ pub(crate) fn do_readdirplus(
             Ok(c) => c,
             Err(_) => continue,
         };
-        match inode::do_lookup(fs, inode, &name_cstr) {
+        match lookup_in_dir(fs, inode, dir_fd, &name_cstr) {
             Ok(entry) => {
                 let mut de = de;
                 let file_type = platform::mode_file_type(entry.attr.st_mode);
@@ -165,6 +168,7 @@ pub(crate) fn do_readdirplus_for_each(
 
     let snapshot = snapshot_lock.as_ref().unwrap();
     let mut emitted_lookup_refs = Vec::new();
+    let dir_fd = data.file.read().unwrap().as_raw_fd();
 
     for snapshot_entry in dir_snapshot::snapshot_entries_after(&snapshot.entries, offset) {
         let name_bytes = snapshot_entry.name();
@@ -191,7 +195,7 @@ pub(crate) fn do_readdirplus_for_each(
             Ok(c) => c,
             Err(_) => continue,
         };
-        let (entry, looked_up_inode) = match inode::do_lookup(fs, inode, &name_cstr) {
+        let (entry, looked_up_inode) = match lookup_in_dir(fs, inode, dir_fd, &name_cstr) {
             Ok(entry) => {
                 let file_type = platform::mode_file_type(entry.attr.st_mode);
                 dir_entry.type_ = mode_to_dtype(file_type);
@@ -266,6 +270,26 @@ impl SnapshotEntry for PassthroughDirEntry {
 //--------------------------------------------------------------------------------------------------
 // Functions: Helpers
 //--------------------------------------------------------------------------------------------------
+
+/// Look up an entry of the directory `inode`, which the handle being listed holds open as
+/// `dir_fd`. The descriptor stays valid while the caller holds the directory handle table.
+fn lookup_in_dir(
+    fs: &PassthroughFs,
+    inode: u64,
+    dir_fd: i32,
+    name: &std::ffi::CStr,
+) -> io::Result<Entry> {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = inode;
+        inode::do_lookup_in_dir(fs, dir_fd, name)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = dir_fd;
+        inode::do_lookup(fs, inode, name)
+    }
+}
 
 /// Convert a file mode type to a directory entry type.
 fn mode_to_dtype(mode_type: u32) -> u32 {

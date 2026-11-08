@@ -469,6 +469,8 @@ impl PassthroughFs {
             retained_fd: Mutex::new(None),
             #[cfg(target_os = "macos")]
             unlinked_fd: std::sync::atomic::AtomicI64::new(-1),
+            #[cfg(target_os = "macos")]
+            patch_cache: Default::default(),
         });
 
         let mut inodes = self.inodes.write().unwrap();

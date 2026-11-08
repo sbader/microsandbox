@@ -101,6 +101,10 @@ pub(crate) struct InodeData {
     /// the file has not been unlinked.
     #[cfg(target_os = "macos")]
     pub unlinked_fd: AtomicI64,
+
+    /// Patched stat from the last lookup, reused while the host ctime is unchanged.
+    #[cfg(target_os = "macos")]
+    pub patch_cache: super::stat_override::PatchedStatCache,
 }
 
 //--------------------------------------------------------------------------------------------------

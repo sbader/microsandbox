@@ -229,6 +229,18 @@ pub(crate) fn do_lookup(fs: &PassthroughFs, parent: u64, name: &CStr) -> io::Res
     return do_lookup_macos(fs, parent_fd.raw(), name);
 }
 
+/// Like [`do_lookup`], with the parent already open as `parent_fd`, as readdirplus has it for
+/// the whole listing, which saves reopening it for each entry.
+#[cfg(target_os = "macos")]
+pub(crate) fn do_lookup_in_dir(
+    fs: &PassthroughFs,
+    parent_fd: i32,
+    name: &CStr,
+) -> io::Result<Entry> {
+    crate::backends::shared::name_validation::validate_name(name)?;
+    do_lookup_macos(fs, parent_fd, name)
+}
+
 /// Linux lookup: open → statx(AT_EMPTY_PATH) → patched_stat (3 syscalls).
 ///
 /// This is more efficient than the fstatat + statx + open path (4 syscalls),
@@ -330,31 +342,41 @@ fn do_lookup_linux(
 
 /// macOS lookup: fstatat → check table → register.
 ///
-/// Opens a real fd via `/.vol/dev/ino` for xattr access since macOS
-/// doesn't store per-inode fds (inode_raw_fd returns -1). The `/.vol/`
-/// path scheme references files by device+inode identity, making it
-/// stable across renames — similar to Linux's `/proc/self/fd/N`.
+/// macOS doesn't store per-inode fds, so the override xattr is read through
+/// `/.vol/dev/ino`, which names the inode by identity like Linux's
+/// `/proc/self/fd/N`.
 #[cfg(target_os = "macos")]
 fn do_lookup_macos(fs: &PassthroughFs, parent_fd: i32, name: &CStr) -> io::Result<Entry> {
     let st = platform::fstatat_nofollow(parent_fd, name)?;
     let alt_key = InodeAltKey::new(platform::stat_ino(&st), platform::stat_dev(&st));
-
-    // Open a real fd for xattr access via /.vol/dev/ino.
-    let patched = open_and_patch_stat_macos(
-        platform::stat_dev(&st),
-        platform::stat_ino(&st),
-        st,
-        fs.cfg.xattr_enabled(),
-        fs.cfg.strict_enabled(),
-        fs.cfg.bind_identity_map.as_ref(),
-    )?;
+    let map = fs.cfg.bind_identity_map.as_ref();
+    let patch = |cache: &crate::backends::shared::stat_override::PatchedStatCache| {
+        if let Some(patched) = cache.get(&st, map) {
+            return Ok(patched);
+        }
+        let patched = open_and_patch_stat_macos(
+            platform::stat_dev(&st),
+            platform::stat_ino(&st),
+            st,
+            fs.cfg.xattr_enabled(),
+            fs.cfg.strict_enabled(),
+            map,
+        )?;
+        if fs.cfg.xattr_enabled() {
+            cache.store(&st, &patched, map);
+        }
+        io::Result::Ok(patched)
+    };
 
     // Fast path: most lookups hit an already-tracked inode and only need a
     // refcount bump. We still recheck under the write lock below before
-    // inserting to close the concurrent registration race.
+    // inserting to close the concurrent registration race. The patch is
+    // taken under the read lock so a concurrent forget can't remove the inode
+    // before its refcount is bumped.
     {
         let inodes = fs.inodes.read().unwrap();
         if let Some(data) = inodes.get_alt(&alt_key) {
+            let patched = patch(&data.patch_cache)?;
             data.refcount.fetch_add(1, Ordering::Acquire);
             return Ok(Entry {
                 inode: data.inode,
@@ -369,6 +391,8 @@ fn do_lookup_macos(fs: &PassthroughFs, parent_fd: i32, name: &CStr) -> io::Resul
 
     // Recheck under the write lock so concurrent lookups cannot register two
     // synthetic inode numbers for the same host identity.
+    let patch_cache = crate::backends::shared::stat_override::PatchedStatCache::default();
+    let patched = patch(&patch_cache)?;
     let mut inodes = fs.inodes.write().unwrap();
     if let Some(data) = inodes.get_alt(&alt_key) {
         data.refcount.fetch_add(1, Ordering::Acquire);
@@ -390,6 +414,8 @@ fn do_lookup_macos(fs: &PassthroughFs, parent_fd: i32, name: &CStr) -> io::Resul
         refcount: std::sync::atomic::AtomicU64::new(1),
         #[cfg(target_os = "macos")]
         unlinked_fd: std::sync::atomic::AtomicI64::new(-1),
+        #[cfg(target_os = "macos")]
+        patch_cache,
     });
     inodes.insert(inode_num, alt_key, data);
 
@@ -403,12 +429,10 @@ fn do_lookup_macos(fs: &PassthroughFs, parent_fd: i32, name: &CStr) -> io::Resul
     })
 }
 
-/// Open a real fd via `/.vol/dev/ino` for xattr access and apply stat patching.
+/// Apply stat patching from the override xattr of the inode at `/.vol/dev/ino`.
 ///
-/// Tries O_RDONLY first, then O_RDONLY|O_DIRECTORY (for directories that reject
-/// plain O_RDONLY), falls back to unpatched stat if neither succeeds. This is
-/// necessary because macOS doesn't store per-inode fds, so we must open a
-/// temporary fd solely for `fgetxattr` to read the override stat.
+/// The xattr is read by path, so a lookup doesn't open the file; the path names the inode by
+/// identity, and a symlink's own xattr is read rather than its target's.
 #[cfg(target_os = "macos")]
 fn open_and_patch_stat_macos(
     dev: u64,
@@ -418,47 +442,13 @@ fn open_and_patch_stat_macos(
     strict: bool,
     bind_identity_map: Option<&crate::backends::shared::stat_override::BindIdentityMapHandle>,
 ) -> io::Result<stat64> {
-    let path = vol_path(dev, ino);
-
-    // Try regular file open first. If the inode is a symlink, fall back to
-    // O_SYMLINK so we can read override metadata from the link itself without
-    // following it.
-    if let Ok(fd) = open_macos_path_for_stat(path.as_ptr()) {
-        let result = crate::backends::shared::stat_override::patched_stat(
-            fd,
-            st,
-            xattr_enabled,
-            strict,
-            bind_identity_map,
-        );
-        unsafe { libc::close(fd) };
-        return result;
-    }
-
-    // Can't open — return the safe mapped fallback when stat virtualization is on.
-    let mut st = st;
-    if xattr_enabled {
-        crate::backends::shared::stat_override::apply_bind_identity_map(&mut st, bind_identity_map);
-    }
-    Ok(st)
-}
-
-#[cfg(target_os = "macos")]
-fn open_macos_path_for_stat(path: *const libc::c_char) -> io::Result<i32> {
-    match open_macos_inode_reopen(path, libc::O_RDONLY) {
-        Ok(fd) => return Ok(fd),
-        Err(err) if err.raw_os_error() == platform::eloop().raw_os_error() => {
-            let fd =
-                unsafe { libc::open(path, libc::O_RDONLY | libc::O_CLOEXEC | libc::O_SYMLINK) };
-            if fd < 0 {
-                return Err(platform::linux_error(io::Error::last_os_error()));
-            }
-            return Ok(fd);
-        }
-        Err(_) => {}
-    }
-
-    open_macos_inode_reopen(path, libc::O_RDONLY | libc::O_DIRECTORY)
+    crate::backends::shared::stat_override::patched_stat_at_path(
+        &vol_path(dev, ino),
+        st,
+        xattr_enabled,
+        strict,
+        bind_identity_map,
+    )
 }
 
 /// Decrement the reference count for an inode. Remove it from the table
@@ -1067,33 +1057,29 @@ pub(crate) fn stat_inode(fs: &PassthroughFs, inode: u64) -> io::Result<stat64> {
             );
         }
 
-        if let Ok(fd) = open_vol_fd(data.dev, data.ino) {
-            let result = platform::fstat(fd).and_then(|st| {
-                crate::backends::shared::stat_override::patched_stat(
-                    fd,
-                    st,
-                    fs.cfg.xattr_enabled(),
-                    fs.cfg.strict_enabled(),
-                    fs.cfg.bind_identity_map.as_ref(),
-                )
-            });
-            unsafe { libc::close(fd) };
-            return result;
-        }
-
+        // The path names the inode itself, so lstat and the path xattr read need no open, and
+        // the patch from the last lookup or getattr is reused while the host ctime is unchanged.
         let path = vol_path(data.dev, data.ino);
         let mut st = unsafe { std::mem::zeroed::<stat64>() };
         let ret = unsafe { libc::lstat(path.as_ptr(), &mut st) };
         if ret < 0 {
             return Err(platform::linux_error(io::Error::last_os_error()));
         }
-        open_and_patch_stat_macos(
+        let map = fs.cfg.bind_identity_map.as_ref();
+        if let Some(patched) = data.patch_cache.get(&st, map) {
+            return Ok(patched);
+        }
+        let patched = open_and_patch_stat_macos(
             data.dev,
             data.ino,
             st,
             fs.cfg.xattr_enabled(),
             fs.cfg.strict_enabled(),
-            fs.cfg.bind_identity_map.as_ref(),
-        )
+            map,
+        )?;
+        if fs.cfg.xattr_enabled() {
+            data.patch_cache.store(&st, &patched, map);
+        }
+        Ok(patched)
     }
 }

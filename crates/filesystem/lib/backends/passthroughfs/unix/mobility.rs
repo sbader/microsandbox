@@ -900,6 +900,7 @@ fn inode_data_from_fd(
             dev,
             refcount: std::sync::atomic::AtomicU64::new(saved.refcount),
             unlinked_fd: std::sync::atomic::AtomicI64::new(-1),
+            patch_cache: Default::default(),
         }),
     ))
 }
